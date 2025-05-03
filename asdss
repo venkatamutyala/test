@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+
+import boto3
+import sys
+import os
+import operator
+from botocore.exceptions import NoCredentialsError, PartialCredentialsError, NoRegionError, ClientError
+
+print("Fetching IAM resources with 'Name' tag, sorting, and including Console URLs...")
+print("")
+
+# --- Configuration ---
+# Get region from environment variable or use a default
+region = os.environ.get("AWS_DEFAULT_REGION")
+if not region:
+    region = os.environ.get("AWS_REGION")
+if not region:
+    region = "us-east-1" # Or set your preferred default region
+    print(f"Warning: AWS_DEFAULT_REGION or AWS_REGION environment variable not set. Using default region: {region}", file=sys.stderr)
+
+# Define suggested column widths for the initial columns in the NEW order
+# Note: ARN and Console URL will not strictly adhere to these widths if content is longer
+COL_WIDTHS = {
+    "type": 10,      # Type is now first
+    "tag_name": 30,
+    "aws_name": 30,
+    # ARN and Console URL are dynamic
+}
+
+# --- Helper Functions (Same as before) ---
+
+def get_iam_client(region_name):
+    """Initializes and returns an IAM boto3 client."""
+    try:
+        return boto3.client('iam', region_name=region_name)
+    except (NoCredentialsError, PartialCredentialsError):
+        print("Error: AWS credentials not found. Configure your credentials.", file=sys.stderr)
+        sys.exit(1)
+    except NoRegionError:
+        print(f"Error: Region not specified. Please set AWS_REGION or use --region.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"An unexpected error occurred creating IAM client: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def get_tag_value(tags, key_name="Name"):
+    """Finds a specific tag value in a list of tags."""
+    if not tags:
+        return ""
+    for tag in tags:
+        if tag.get('Key') == key_name:
+            return tag.get('Value', "")
+    return ""
+
+def build_console_url(resource_type, region, resource_identifier):
+    """Constructs the AWS console URL for a resource."""
+    base_url = f"https://{region}.console.aws.amazon.com/iam/home#"
+    if resource_type == 'user':
+        return f"{base_url}/users/{resource_identifier}"
+    elif resource_type == 'role':
+        return f"{base_url}/roles/{resource_identifier}"
+    elif resource_type == 'policy':
+         # Policies console URL typically uses the policy name
+        return f"{base_url}/policies/{resource_identifier}"
+    return "" # Unknown type
+
+
+# --- Main Logic (Same fetching part as before) ---
+
+iam_client = get_iam_client(region)
+all_resources = []
+
+# --- Fetch IAM Users with Pagination ---
+print("Fetching IAM Users...")
+try:
+    paginator = iam_client.get_paginator('list_users')
+    for page in paginator.paginate():
+        for user in page.get('Users', []):
+            user_name = user.get('UserName')
+            user_arn = user.get('Arn')
+
+            tag_name = ""
+            try:
+                tag_response = iam_client.list_user_tags(UserName=user_name)
+                tag_name = get_tag_value(tag_response.get('Tags'))
+            except ClientError as e:
+                 pass # Suppress like bash
+
+            if tag_name:
+                console_url = build_console_url('user', region, user_name)
+                all_resources.append({
+                    "aws_name": user_name,
+                    "tag_name": tag_name,
+                    "type": "user",
+                    "arn": user_arn,
+                    "console_url": console_url
+                })
+except ClientError as e:
+    print(f"Error fetching IAM users: {e}", file=sys.stderr)
+except Exception as e:
+    print(f"An unexpected error occurred while fetching users: {e}", file=sys.stderr)
+
+print("Finished fetching IAM Users.")
+print("")
+
+
+# --- Fetch IAM Roles with Pagination ---
+print("Fetching IAM Roles...")
+try:
+    paginator = iam_client.get_paginator('list_roles')
+    for page in paginator.paginate():
+        for role in page.get('Roles', []):
+            role_name = role.get('RoleName')
+            role_arn = role.get('Arn')
+
+            tag_name = ""
+            try:
+                tag_response = iam_client.list_role_tags(RoleName=role_name)
+                tag_name = get_tag_value(tag_response.get('Tags'))
+            except ClientError as e:
+                 pass # Suppress like bash
+
+            if tag_name:
+                console_url = build_console_url('role', region, role_name)
+                all_resources.append({
+                    "aws_name": role_name,
+                    "tag_name": tag_name,
+                    "type": "role",
+                    "arn": role_arn,
+                    "console_url": console_url
+                })
+except ClientError as e:
+    print(f"Error fetching IAM roles: {e}", file=sys.stderr)
+except Exception as e:
+    print(f"An unexpected error occurred while fetching roles: {e}", file=sys.stderr)
+
+
+print("Finished fetching IAM Roles.")
+print("")
+
+
+# --- Fetch IAM Policies (Customer Managed) with Pagination ---
+print("Fetching IAM Policies (Customer Managed)...")
+try:
+    paginator = iam_client.get_paginator('list_policies')
+    for page in paginator.paginate(Scope='Local'):
+        for policy in page.get('Policies', []):
+            policy_name = policy.get('PolicyName')
+            policy_arn = policy.get('Arn')
+
+            tag_name = ""
+            try:
+                tag_response = iam_client.list_policy_tags(PolicyArn=policy_arn)
+                tag_name = get_tag_value(tag_response.get('Tags'))
+            except ClientError as e:
+                 pass # Suppress like bash
+
+            if tag_name:
+                 console_url = build_console_url('policy', region, policy_name)
+                 all_resources.append({
+                     "aws_name": policy_name,
+                     "tag_name": tag_name,
+                     "type": "policy",
+                     "arn": policy_arn,
+                     "console_url": console_url
+                 })
+except ClientError as e:
+    print(f"Error fetching IAM policies: {e}", file=sys.stderr)
+except Exception as e:
+    print(f"An unexpected error occurred while fetching policies: {e}", file=sys.stderr)
+
+print("Finished fetching IAM Policies.")
+print("")
+
+# --- Sort and Print Results ---
+
+# Sort the collected resources
+# Sort primarily by 'tag_name' (Name based on the tag)
+# Optional: add 'type', 'aws_name' as secondary/tertiary sort keys if needed for tie-breaking
+# For now, sorting ONLY by tag_name as requested "sort by Name based on the tag"
+all_resources.sort(key=operator.itemgetter('tag_name'))
+
+
+# Print header
+# Define the header columns and their padding widths (None for dynamic) in the NEW order
+header_cols = [
+    ("Type", COL_WIDTHS['type']), # Type is now first
+    ("Name (from Tag)", COL_WIDTHS['tag_name']),
+    ("AWS Name", COL_WIDTHS['aws_name']),
+    ("ARN", None), # Dynamic width
+    ("Console URL", None) # Dynamic width
+]
+
+# Build header string and separator line
+header_str_parts = []
+separator_str_parts = []
+
+for col_name, width in header_cols:
+    if width is not None:
+        # Fixed width column - header padded
+        header_str_parts.append(f"{col_name:<{width}}")
+        separator_str_parts.append("-" * width)
+    else:
+        # Dynamic width column - just add the name to the header
+        header_str_parts.append(col_name)
+        # Use a minimum dash length for separator under dynamic columns
+        separator_str_parts.append("-" * max(len(col_name), 10)) # Minimum 10 dashes
+
+header = " | ".join(header_str_parts)
+separator = "-|-".join(separator_str_parts) # Join separators with "-|-"
+
+print(header)
+print(separator)
+
+# Print sorted data
+for resource in all_resources:
+    # For fixed-width columns, truncate content if it exceeds the width
+    type_display = resource['type'][:COL_WIDTHS['type']] # Truncate type if too long
+    tag_name_display = resource['tag_name'][:COL_WIDTHS['tag_name']]
+    aws_name_display = resource['aws_name'][:COL_WIDTHS['aws_name']]
+
+
+    # Print fixed width padded columns, then dynamic columns in the NEW order
+    print(
+        f"{type_display:<{COL_WIDTHS['type']}} | "
+        f"{tag_name_display:<{COL_WIDTHS['tag_name']}} | "
+        f"{aws_name_display:<{COL_WIDTHS['aws_name']}} | "
+        f"{resource['arn']} | " # ARN is dynamic
+        f"{resource['console_url']}" # Console URL is dynamic
+    )
+
+print("")
+print(f"Done. Found {len(all_resources)} resources with the 'Name' tag.")
